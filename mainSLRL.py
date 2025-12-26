@@ -37,7 +37,7 @@ if __name__ == '__main__':
     parser.add_argument('--search_size', type=int, default=1)
     parser.add_argument('--si', type=int, default=0.9)      # 测试相似度用
     parser.add_argument('--resfileName', type=str, default='sp_cluster')
-    parser.add_argument('--ablation', type=int, default=1)
+    parser.add_argument('--ablation', type=int, default=0)
     parser.add_argument('--k', type=int, default=2)
 
 
