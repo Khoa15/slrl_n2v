@@ -1,0 +1,12 @@
+Dataset: amazon
+  Precision: 0.92857
+  Recall   : 1.0
+  F1       : 0.96296
+  Jaccard  : 0.92857
+--------------------
+Dataset: dblp
+  Precision: 0.61538
+  Recall   : 0.8
+  F1       : 0.69565
+  Jaccard  : 0.53333
+--------------------
