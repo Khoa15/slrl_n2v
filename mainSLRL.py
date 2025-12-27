@@ -12,7 +12,7 @@ def run(args):
     seeds, com_indexs = getseedsAndtruecom(args, args.dataset)
     print("search_size, args.start", len(seeds))
     for i in range(len(seeds)):
-        print(f"正在处理_{args.dataset}_第{i}个节点")
+        print(f"Processing_{args.dataset}_Node_{i}")
         seed, com_index = seeds[i], com_indexs[i]
         detector = Detector(args, seed, com_index)
         res = detector.detect()
@@ -28,6 +28,7 @@ if __name__ == '__main__':
 
     # Model
     parser.add_argument('--hidden_size', type=int, default=64)
+    parser.add_argument('--embedding_dim', type=int, default=32)
     parser.add_argument('--g_lr', type=float, default=1e-2)
 
     # Train

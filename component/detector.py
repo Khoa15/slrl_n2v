@@ -61,7 +61,7 @@ class Detector:
         # self.computeSimiAndWrite()
 
         # 初始化expander
-        self.device = torch.device('cuda:0')
+        self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         self.expander = self.init_expander()
 
     def is_connected_graph(self, graph):
@@ -108,12 +108,41 @@ class Detector:
         '''
         初始化expander
         '''
+        from component.node2vec_embedding import Node2VecEmbedding
+
         args = self.args
         device = self.device
-        expander_model = Agent(args.hidden_size).to(device)
+        
+        # --- Deep Learning: Generate Node2Vec Embeddings ---
+        print("Generating Node2Vec Embeddings for Deep RL Agent...")
+        embedding_dim = getattr(args, 'embedding_dim', 32) # Default to 32 if not set
+        
+        # Use simple networkx for embedding generation on the subgraph
+        # knowcomSeedGraph.adj_mat is scipy sparse. Convert to nx.
+        G_nx = nx.from_scipy_sparse_array(self.knowcomSeedGraph.adj_mat)
+        
+        embedder = Node2VecEmbedding(dimension=embedding_dim, walk_length=10, num_walks=10, window_size=5)
+        # fit_transform returns dict: node_idx -> vector
+        emb_dict = embedder.fit_transform(G_nx)
+        
+        # Convert to matrix aligned with graph nodes (0 to n_nodes-1)
+        n_nodes = self.knowcomSeedGraph.n_nodes
+        node_embeddings = np.zeros((n_nodes, embedding_dim), dtype=np.float32)
+        for i in range(n_nodes):
+            if i in emb_dict:
+                node_embeddings[i] = emb_dict[i]
+            else:
+                # Should not happen for initial graph, but as fallback
+                pass
+        
+        # Input dim = 1 (Diffusion Scalar) + Embedding Dim
+        agent_input_dim = 1 + embedding_dim
+        print(f"Agent Input Dimension: {agent_input_dim}")
+
+        expander_model = Agent(args.hidden_size, input_dim=agent_input_dim).to(device)
         expander_optimizer = optim.Adam(expander_model.parameters(), lr=args.g_lr)
         expander = Expander(args, self.knowcomSeedGraph, expander_model, expander_optimizer, device,
-                      max_size=args.max_size)
+                      max_size=args.max_size, node_embeddings=node_embeddings)
         return expander
 
     def detect(self):
@@ -130,7 +159,7 @@ class Detector:
             for _ in range(self.args.epochs):
                 self.train_expander()
             print('=' * 50)
-            print(f'迭代{iter_num}[Test]')
+            print(f'Iter_{iter_num}[Test]')
             if iter_num == 1:
                 pred_com = [[self.seed]]
             pred_com = self.expander.generateCommunity(pred_com)

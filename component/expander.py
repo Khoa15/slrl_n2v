@@ -22,7 +22,8 @@ class Expander:
                  max_size: int = 25,
                  k: int = 3,
                  alpha: float = 0.85,
-                 gamma: float = 0.99,):
+                 gamma: float = 0.99,
+                 node_embeddings: Optional[np.ndarray] = None):
         self.graph = graph
         self.model = model
         self.optimizer = optimizer
@@ -31,6 +32,7 @@ class Expander:
         self.conv = GraphConv(graph, k, alpha)
         self.gamma = gamma
         self.args = args
+        self.node_embeddings = node_embeddings
         if device is None:
             self.device = torch.device('cpu')
         else:
@@ -229,6 +231,16 @@ class Expander:
             extended_matrix = sp.csc_matrix((new_n_nodes, bs), dtype=np.float32)
             extended_matrix[:self.n_nodes, :] = z_nodes
             z_nodes = extended_matrix
+            
+            # Update Node Embeddings Matrix
+            if self.node_embeddings is not None:
+                emb_dim = self.node_embeddings.shape[1]
+                added_count = new_n_nodes - self.n_nodes
+                # Initialize new embeddings (e.g., zeros or random, or average of neighbors if possible)
+                # For simplicity, Zeros
+                new_embs = np.zeros((added_count, emb_dim), dtype=np.float32)
+                self.node_embeddings = np.vstack([self.node_embeddings, new_embs])
+
             # 更新 self.n_nodes 以反映新的节点总数
             self.n_nodes = new_n_nodes
             self.conv.updateGraph(self.graph)
@@ -300,15 +312,32 @@ class Expander:
             # assert len(candidate_nodes)
             involved_nodes = candidate_nodes + trajectories[i]  # involved_nodes保存当前社区和其边界节点
             batch_candidates.append(candidate_nodes)  # candidates
-            vals_seed.append(z_seeds.T[i, involved_nodes].todense())   # 本来是使用经过GNN，这里将其缩减维只跟involved_nodes相关的表示，可以很容易知道vals_seed中各元素长度不等
-            vals_node.append(z_nodes.T[i, involved_nodes].todense())    # z_nodes是当前社区的向量表示
+            # z_seeds is (AllNodes, BS). We want seeds for batch i, at specific nodes.
+            # Slice [involved_nodes, i] gives (Num_Involved, 1).
+            vals_seed_scalar = z_seeds[involved_nodes, i].todense()
+            vals_node_scalar = z_nodes[involved_nodes, i].todense()
+            
+            # Combine scalars with embeddings if available
+            if self.node_embeddings is not None:
+                # Embeddings shape: [Num_Involved, Emb_Dim]
+                current_embs = self.node_embeddings[involved_nodes]
+                
+                # Concatenate: [Scalar, Embedding] -> (N, 1+D)
+                vals_seed.append(np.concatenate([vals_seed_scalar, current_embs], axis=1))
+                vals_node.append(np.concatenate([vals_node_scalar, current_embs], axis=1))
+            else:
+                vals_seed.append(vals_seed_scalar)
+                vals_node.append(vals_node_scalar)
+
             indptr.append((offset, offset + len(involved_nodes), offset + len(candidate_nodes)))        # 因为各个社区/节点的向量长度不一样，这里记录
             offset += len(involved_nodes)
 
-        vals_seed = np.array(np.concatenate(vals_seed, 1))[0]           # 将一个bs的vals_seed拼接成一个一维向量
-        vals_node = np.array(np.concatenate(vals_node, 1))[0]
-        vals_seed = torch.from_numpy(vals_seed).to(self.device)
-        vals_node = torch.from_numpy(vals_node).to(self.device)
+        vals_seed = np.array(np.concatenate(vals_seed, 0))
+        vals_node = np.array(np.concatenate(vals_node, 0))
+        
+        # Ensure float32
+        vals_seed = torch.from_numpy(vals_seed).float().to(self.device)
+        vals_node = torch.from_numpy(vals_node).float().to(self.device)
         indptr = np.array(indptr)                   # 由于每个节点的表示长度不一样，这里indptr用于标记start和end的位置
         # 准备输入 vals_seed记录bs种子节点的向量表示，vals_node记录当前bs个社区节点的向量表示。
         # 由于转换成一个维度，这里使用indptr区分各个节点/社区的位置

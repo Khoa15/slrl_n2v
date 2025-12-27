@@ -6,12 +6,13 @@ from .layers import Swish, make_linear_block
 
 class Agent(nn.Module):
 
-    def __init__(self, hidden_size, norm_type=None):
+    def __init__(self, hidden_size, input_dim=1, norm_type=None):
         super().__init__()
         self.hidden_size = hidden_size
+        self.input_dim = input_dim
 
-        self.seed_embedding = nn.Linear(1, hidden_size, bias=False)
-        self.node_embedding = nn.Linear(1, hidden_size, bias=False)
+        self.seed_embedding = nn.Linear(input_dim, hidden_size, bias=False)
+        self.node_embedding = nn.Linear(input_dim, hidden_size, bias=False)
         self.input_mapping = nn.Sequential(
             make_linear_block(hidden_size, hidden_size, Swish, norm_type),
             make_linear_block(hidden_size, hidden_size, Swish, norm_type)
@@ -23,7 +24,13 @@ class Agent(nn.Module):
         nn.init.zeros_(self.stopping_score_layer.weight.data)
 
     def forward(self, x_seeds, x_nodes, indptr):
-        h = self.seed_embedding(x_seeds.unsqueeze(1)) + self.node_embedding(x_nodes.unsqueeze(1))
+        # Ensure dimensions match [Batch, Dim]
+        if x_seeds.dim() == 1:
+            x_seeds = x_seeds.unsqueeze(1)
+        if x_nodes.dim() == 1:
+            x_nodes = x_nodes.unsqueeze(1)
+
+        h = self.seed_embedding(x_seeds) + self.node_embedding(x_nodes)
         h = self.input_mapping(h)
         node_scores = self.node_score_layer(h).squeeze(1)
 
