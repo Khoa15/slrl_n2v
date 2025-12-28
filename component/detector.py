@@ -29,8 +29,9 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 class Detector:
 
-    def __init__(self, args, seed, com_index):
+    def __init__(self, args, seed, com_index, logger=None):
         self.args = args
+        self.logger = logger
         # 获取图、已知社区、种子节点
         self.graph, self.coms = self.loadDataset(args.root, args.dataset)
         self.oldKnowcoms = self.coms[-args.train_size:]   # 后100
@@ -40,7 +41,7 @@ class Detector:
             fileedge = f"datasets/{self.args.dataset}/{self.args.dataset}-1.90.ungraph.txt"
             G = self.networkx(fileedge)
             self.oldKnowcoms = self.remove_disconnected_communities(self.oldKnowcoms, G)
-            print("len(communities_copy):", len(self.oldKnowcoms))
+            if self.logger: self.logger.log(f"Connected communities count: {len(self.oldKnowcoms)}")
 
         # 获取子图（种子节点的k-ego以及已知社区的k层邻居），给所有节点重新编号，记录映射关系
         knowcomSeed_nodes = set([node for com in self.coms[-args.train_size:] for node in com] + [seed])   # 后100
@@ -107,13 +108,14 @@ class Detector:
         '''
         初始化expander
         '''
+        tobelog = self.logger.log if self.logger else print
         from component.gnn import GIN, normalize_adj_torch
 
         args = self.args
         device = self.device
         
         # --- Deep Learning: GIN Embeddings ---
-        print("Initializing GIN for Deep RL Agent...", flush=True)
+        tobelog("Initializing GIN for Deep RL Agent...")
         embedding_dim = getattr(args, 'embedding_dim', 32)
         
         # GIN Model
@@ -123,7 +125,7 @@ class Detector:
         
         # Input dim = 1 (Diffusion Scalar) + Embedding Dim (GIN Output)
         agent_input_dim = 1 + embedding_dim
-        print(f"Agent Input Dimension: {agent_input_dim}")
+        tobelog(f"Agent Input Dimension: {agent_input_dim}")
 
         expander_model = Agent(args.hidden_size, input_dim=agent_input_dim).to(device)
         
@@ -139,7 +141,7 @@ class Detector:
         '''
         检测社区
         '''
-
+        tobelog = self.logger.log if self.logger else print
         res = []
         pred_com = [[self.seed]]
         tic = time.time()
@@ -148,13 +150,25 @@ class Detector:
                 self.updateTraincom(pred_com[0])
             for _ in range(self.args.epochs):
                 self.train_expander()
-            print('=' * 50)
-            print(f'Iter_{iter_num}[Test]')
+            tobelog('=' * 50)
+            tobelog(f'Iter_{iter_num}[Test]')
             if iter_num == 1:
                 pred_com = [[self.seed]]
             pred_com = self.expander.generateCommunity(pred_com)
             pred_com = [x[:-1] if x[-1] == 'EOS' else x for x in pred_com]
             oldID_pred_com = [self.new_to_old_node_mapping[node] for node in pred_com[0]]
+            
+            # --- Evaluation ---
+            try:
+                # com_index is an int (index of the true community in self.coms)
+                true_idx = self.com_index
+                if 0 <= true_idx < len(self.coms):
+                    true_community = self.coms[true_idx]
+                    p, r, f1, j = self.expander.eval_scores(oldID_pred_com, true_community)
+                    tobelog(f"  [Iter {iter_num} Eval] Prec: {p:.4f} | Rec: {r:.4f} | F1: {f1:.4f} | Jacc: {j:.4f} | Size: {len(oldID_pred_com)} | TrueSize: {len(true_community)}")
+            except Exception as e:
+                tobelog(f"  [Eval Error] Could not evaluate: {e}")
+
             if iter_num == 0:
                 if self.args.ablation == 1:
                     # 消融实验
@@ -162,7 +176,7 @@ class Detector:
                 continue
             res = [self.oldSeed, self.com_index, oldID_pred_com]
         toc = time.time()
-        print(f'Elapsed Time: {(toc - tic) // 60} min {(toc - tic) % 60}s')
+        tobelog(f'Elapsed Time: {(toc - tic) // 60} min {(toc - tic) % 60}s')
         return res
 
     def select_lists(self, matrix, n):
@@ -241,6 +255,81 @@ class Detector:
         sim_matrix = cosine_similarity(com_matrix_np)
         return (sim_matrix + 1) / 2 # Normalize to [0, 1]
 
+        return traincom
+
+    def UsingEnsembleSelectCom(self, simi, communities, K=2):
+        '''
+        Ensemble Clustering: Spectral + Agglomerative + KMedoids
+        '''
+        # 1. Prepare Distance Matrix
+        dist_matrix = 1 - simi
+        np.fill_diagonal(dist_matrix, 0)
+        dist_sq = squareform(dist_matrix, checks=False) # Ensure it's condensed for linkage if needed, or square for others
+
+        n_samples = simi.shape[0]
+        co_association = np.zeros((n_samples, n_samples))
+        
+        # --- Algo 1: Spectral Clustering ---
+        try:
+            sc = SpectralClustering(n_clusters=K, affinity='precomputed', random_state=0)
+            labels1 = sc.fit_predict(simi)
+        except:
+            labels1 = np.zeros(n_samples) # Fallback
+
+        # --- Algo 2: Agglomerative (Hierarchical) ---
+        try:
+            # Complete linkage tends to find compact clusters
+            linked = linkage(dist_sq, 'complete')
+            labels2 = fcluster(linked, K, criterion='maxclust')
+            # Adjust to 0-indexed if fcluster returns 1-based (it usually does)
+            labels2 = labels2 - 1
+        except:
+            labels2 = np.zeros(n_samples)
+
+        # --- Algo 3: K-Medoids ---
+        try:
+            kmedoids = KMedoids(n_clusters=K, metric='precomputed', random_state=0)
+            kmedoids.fit(dist_matrix)
+            labels3 = kmedoids.labels_
+        except:
+            labels3 = np.zeros(n_samples)
+
+        # --- Consensus ---
+        # Matrix Construct
+        for i in range(n_samples):
+            for j in range(i + 1, n_samples):
+                score = 0
+                if labels1[i] == labels1[j]: score += 1
+                if labels2[i] == labels2[j]: score += 1
+                if labels3[i] == labels3[j]: score += 1
+                
+                co_association[i][j] = score
+                co_association[j][i] = score
+        
+        # Normalize
+        co_association = co_association / 3.0
+        np.fill_diagonal(co_association, 1.0)
+        
+        # Final Clustering on Co-association Matrix
+        # Using Spectral again as it handles affinity well
+        final_sc = SpectralClustering(n_clusters=K, affinity='precomputed', random_state=42)
+        try:
+            final_labels = final_sc.fit_predict(co_association)
+        except:
+            # Fallback if singular
+            final_labels = labels1
+
+        # Select community with seed (index 0)
+        traincom = []
+        target_label = final_labels[0]
+        for i in range(1, len(final_labels)):
+            if final_labels[i] == target_label:
+                traincom.append(communities[i])
+        
+        print(f"Ensemble Selected {len(traincom)} communities.")
+        return traincom
+
+
     def updateTraincom(self, com):
         '''
         更新训练集
@@ -255,15 +344,24 @@ class Detector:
         
         traincom = []
         k = self.args.k
-        # traincom = self.UsingScSelectCom(simi, communities_copy, 2)
-        if self.args.resfileName == "sp_cluster":
+        
+        # Logic to choose method
+        method = self.args.resfileName
+        
+        if method == "sp_cluster":
             traincom = self.UsingScSelectCom(simi, communities_copy, k)
-        elif self.args.resfileName == "KMedoids":
+        elif method == "KMedoids":
             traincom = self.UsingKMedoidsSelectCom(simi, communities_copy, k)
-        elif self.args.resfileName == "Gmm":
+        elif method == "Gmm":
             traincom = self.UsingGmmSelectCom(simi, communities_copy, k)
-        elif self.args.resfileName == "CengCi":
+        elif method == "CengCi":
             traincom = self.UsingCengCiSelectCom(simi, communities_copy, k)
+        elif method == "Ensemble":  # Add this option
+            traincom = self.UsingEnsembleSelectCom(simi, communities_copy, k)
+        else:
+            # Default fallback or if "sp_cluster" is default
+            traincom = self.UsingScSelectCom(simi, communities_copy, k)
+            
         if len(traincom) != 0:
             self.train_comms = traincom
         else:

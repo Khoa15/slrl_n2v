@@ -10,11 +10,26 @@ def run(args):
     @param args: 全局参数
     '''
     seeds, com_indexs = getseedsAndtruecom(args, args.dataset)
-    print("search_size, args.start", len(seeds))
-    for i in range(len(seeds)):
-        print(f"Processing_{args.dataset}_Node_{i}")
-        seed, com_index = seeds[i], com_indexs[i]
-        detector = Detector(args, seed, com_index)
+    
+    # Init Logger
+    from utils import ExperimentLogger
+    logger = ExperimentLogger(args)
+    
+    logger.log(f"Search Size: {len(seeds)}")
+    
+    try:
+        for i in range(len(seeds)):
+            logger.log(f"--- Processing Node {i} ({args.dataset}) ---")
+            seed, com_index = seeds[i], com_indexs[i]
+            detector = Detector(args, seed, com_index, logger)
+            res = detector.detect()
+            writerResToFile(args, res)
+    except Exception as e:
+        logger.log(f"CRITICAL ERROR: {e}")
+        import traceback
+        logger.log(traceback.format_exc())
+    finally:
+        logger.close()
         res = detector.detect()
         writerResToFile(args, res)
 

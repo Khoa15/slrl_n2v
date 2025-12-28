@@ -5,6 +5,8 @@ import torch
 import random
 
 
+import datetime
+
 def seed_all(seed):
     '''
     固定随机种子
@@ -14,6 +16,34 @@ def seed_all(seed):
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     random.seed(seed)
+
+class ExperimentLogger:
+    def __init__(self, args):
+        if not os.path.exists('logs'):
+            os.makedirs('logs')
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Name format: dataset_Time_Epochs_TrainSize_EmbDim_Rest.log
+        self.filename = f"logs/{args.dataset}_{timestamp}_E{args.epochs}_TS{args.train_size}_Dim{args.embedding_dim}_{args.resfileName}.log"
+        self.file = open(self.filename, 'w', encoding='utf-8')
+        self.write_header(args)
+        print(f"Logging to: {self.filename}")
+
+    def write_header(self, args):
+        self.log("="*50)
+        self.log(f"Experiment Started at {datetime.datetime.now()}")
+        self.log(f"Arguments: {vars(args)}")
+        self.log("="*50)
+
+    def log(self, msg):
+        time_str = datetime.datetime.now().strftime("%H:%M:%S")
+        full_msg = f"[{time_str}] {msg}"
+        print(full_msg) 
+        self.file.write(full_msg + '\n')
+        self.file.flush()
+    
+    def close(self):
+        self.log("Experiment Finished.")
+        self.file.close()
 
 def getFileInfo(type):
     '''

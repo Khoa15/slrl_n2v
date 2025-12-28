@@ -139,10 +139,28 @@ class Expander:
                     _, _, after_cost, _ = self.eval_scores(temp_com, true_com)
                     after_cond = self.calculate_conductance_scipy(temp_com)
                     
-                    # Hybrid Reward: F1 improvement + 0.5 * Conductance improvement
-                    # Conductance is lower better, so (pre - after) is positive if improved.
-                    r_structure = pre_cond - after_cond
-                    r.append((after_cost - pre_cost) + 0.5 * r_structure)
+                    # Hybrid Reward Tuning
+                    # Original: F1 improvement + 0.5 * Conductance improvement
+                    # Issue: Low F-Score means the agent isn't learning to match the ground truth well.
+                    # Conductance might be leading it astray (finding tight but wrong clusters).
+                    # Fix: 
+                    # 1. Increase weight on Accuracy (F1/Jaccard).
+                    # 2. Use F-Score directly as the primary signal.
+                    
+                    # Let's boost the signal for F1 gain.
+                    f1_gain = after_cost - pre_cost
+                    
+                    # Conductance gain (structure quality).
+                    cond_gain = pre_cond - after_cond
+                    
+                    # New Reward: 2.0 * F1_Gain + 0.2 * Conductance_Gain
+                    # Prioritize matching the ground truth (Supervised Signal) much more than generic structure.
+                    current_reward = 5.0 * f1_gain + 0.2 * cond_gain
+                    
+                    # Optional: Add small penalty for every step to encourage efficiency? No, community size varies.
+                    
+                    r.append(current_reward)
+            # Discounted Cumulative Reward
             reward = [np.sum(r[i] * (gamma ** np.array(range(i, len(r))))) for i in range(len(r))]
             rewards.append(reward)
         rewards = self.tianchong(rewards, logps)
@@ -408,7 +426,7 @@ class Expander:
         return actions, logps
     
     def calculate_conductance_scipy(self, community_nodes):
-        """
+        r"""
         Calculates the conductance of the community within the self.graph context.
         Conductance = Cut(S, V\S) / Min(Vol(S), Vol(V\S))
         """
