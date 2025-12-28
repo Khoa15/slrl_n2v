@@ -2,14 +2,14 @@ import copy
 from typing import Union, Optional, List, Set, Dict
 import numpy as np
 from scipy import sparse as sp
-from sklearn.decomposition import TruncatedSVD
+
 
 import torch
 from torch import nn
 
 from .env import ExpansionEnv
 from .graph import Graph
-from .gnn import GraphConv
+from .gnn import GraphConv, normalize_adj_torch
 from .agent import Agent
 from .graph import Graph
 
@@ -23,7 +23,7 @@ class Expander:
                  k: int = 3,
                  alpha: float = 0.85,
                  gamma: float = 0.99,
-                 node_embeddings: Optional[np.ndarray] = None):
+                 gnn_model: Optional[nn.Module] = None):
         self.graph = graph
         self.model = model
         self.optimizer = optimizer
@@ -32,7 +32,10 @@ class Expander:
         self.conv = GraphConv(graph, k, alpha)
         self.gamma = gamma
         self.args = args
-        self.node_embeddings = node_embeddings
+        self.gnn = gnn_model
+        # Initial dummy embeddings holder
+        self.current_embeddings = None
+        
         if device is None:
             self.device = torch.device('cpu')
         else:
@@ -49,6 +52,8 @@ class Expander:
         max_size = self.max_size if max_size is None else max_size
         env = ExpansionEnv(self.graph, seeds, max_size)
         self.model.eval()
+        if self.gnn:
+            self.gnn.eval()
         isTrain = False
         with torch.no_grad():
             episodes, _ = self._sample_trajectories(env, isTrain)           # episodes中存放模型预测的结果，即trajectories
@@ -109,6 +114,8 @@ class Expander:
         '''
         bs = len(seeds)
         self.model.train()
+        if self.gnn:
+            self.gnn.train()
         self.optimizer.zero_grad()
         selected_nodes, logps = self.sample_bs_trajectories(seeds)
 
@@ -159,9 +166,19 @@ class Expander:
         '''
         max_size = self.max_size if max_size is None else max_size
         self.model.train()
+        if self.gnn:
+            self.gnn.train()
         self.optimizer.zero_grad()
         env = ExpansionEnv(self.graph, [[x[0]] for x in episodes], max_size)
         bs = env.bs
+        
+        # --- Compute GIN Embeddings for initial graph ---
+        if self.gnn:
+            adj_torch = normalize_adj_torch(self.graph.adj_mat).to(self.device)
+            # Use constant features: ones
+            feat_input = torch.ones(self.n_nodes, self.args.embedding_dim).to(self.device)
+            self.current_embeddings = self.gnn(feat_input, adj_torch)
+
         x_seeds, delta_x_nodes = env.reset()
         z_seeds = self.conv(x_seeds)
         z_nodes = sp.csc_matrix((self.n_nodes, bs), dtype=np.float32)
@@ -187,6 +204,11 @@ class Expander:
                 logps.append(logits[action])
             new_nodes = [x[i] if i < len(x) else 'EOS' for i, x in zip(actions, batch_candidates)]
             delta_x_nodes = env.step(new_nodes, valid_index)
+            # GIN embedding update not needed here as teacher forcing usually works on static graph or doesn't add nodes mid-structure?
+            # Env step expands trajectory but doesn't change underlying graph structure in this context?
+            # ExpansionEnv typically just tracks indices. 
+            # Detector logic updates graph in Inference loop.
+            
             for i, v1 in zip(valid_index, logps):
                 episode_logps[i].append(v1)
         # Stack and Padding
@@ -232,17 +254,16 @@ class Expander:
             extended_matrix[:self.n_nodes, :] = z_nodes
             z_nodes = extended_matrix
             
-            # Update Node Embeddings Matrix
-            if self.node_embeddings is not None:
-                emb_dim = self.node_embeddings.shape[1]
-                added_count = new_n_nodes - self.n_nodes
-                # Initialize new embeddings (e.g., zeros or random, or average of neighbors if possible)
-                # For simplicity, Zeros
-                new_embs = np.zeros((added_count, emb_dim), dtype=np.float32)
-                self.node_embeddings = np.vstack([self.node_embeddings, new_embs])
-
-            # 更新 self.n_nodes 以反映新的节点总数
+            # Update Node Embeddings Matrix (GIN)
+            # Recompute global embeddings due to graph change
             self.n_nodes = new_n_nodes
+            if self.gnn:
+                adj_torch = normalize_adj_torch(self.graph.adj_mat).to(self.device)
+                # Assuming first layer dim
+                feat_input = torch.ones(self.n_nodes, self.args.embedding_dim).to(self.device)
+                with torch.no_grad(): # Usually inference time here
+                    self.current_embeddings = self.gnn(feat_input, adj_torch)
+
             self.conv.updateGraph(self.graph)
         return z_nodes
 
@@ -254,6 +275,20 @@ class Expander:
         @return: 选择的节点以及概率
         '''
         bs = env.bs
+        
+        # --- Pre-compute GIN Embeddings ---
+        if self.gnn:
+             adj_torch = normalize_adj_torch(self.graph.adj_mat).to(self.device)
+             # Use dim from first layer of GIN
+             feat_input = torch.ones(self.n_nodes, self.args.embedding_dim).to(self.device)
+             if isTrain:
+                 # Train mode: Backprop enabled
+                 self.current_embeddings = self.gnn(feat_input, adj_torch)
+             else:
+                 # Inference mode: No grad
+                 with torch.no_grad():
+                     self.current_embeddings = self.gnn(feat_input, adj_torch)
+
         # 这里x_seeds = delta_x_nodes，shape=（总结点数,bs）共bs个one-hot向量
         x_seeds, delta_x_nodes = env.reset()
         # z_seeds是经过一个图卷积的x_seeds，形状不变
@@ -318,13 +353,18 @@ class Expander:
             vals_node_scalar = z_nodes[involved_nodes, i].todense()
             
             # Combine scalars with embeddings if available
-            if self.node_embeddings is not None:
-                # Embeddings shape: [Num_Involved, Emb_Dim]
-                current_embs = self.node_embeddings[involved_nodes]
+            if self.current_embeddings is not None:
+                # Embeddings shape: [N, Emb_Dim] (Tensor)
+                # involved_nodes list
+                current_embs = self.current_embeddings[involved_nodes]
                 
+                # Convert scalars to Tensor
+                v_seed_s = torch.from_numpy(vals_seed_scalar).float().to(self.device)
+                v_node_s = torch.from_numpy(vals_node_scalar).float().to(self.device)
+
                 # Concatenate: [Scalar, Embedding] -> (N, 1+D)
-                vals_seed.append(np.concatenate([vals_seed_scalar, current_embs], axis=1))
-                vals_node.append(np.concatenate([vals_node_scalar, current_embs], axis=1))
+                vals_seed.append(torch.cat([v_seed_s, current_embs], dim=1))
+                vals_node.append(torch.cat([v_node_s, current_embs], dim=1))
             else:
                 vals_seed.append(vals_seed_scalar)
                 vals_node.append(vals_node_scalar)
@@ -332,16 +372,16 @@ class Expander:
             indptr.append((offset, offset + len(involved_nodes), offset + len(candidate_nodes)))        # 因为各个社区/节点的向量长度不一样，这里记录
             offset += len(involved_nodes)
 
-        vals_seed = np.array(np.concatenate(vals_seed, 0))
-        vals_node = np.array(np.concatenate(vals_node, 0))
+        if self.current_embeddings is not None:
+             vals_seed = torch.cat(vals_seed, 0)
+             vals_node = torch.cat(vals_node, 0)
+        else:
+             vals_seed = np.array(np.concatenate(vals_seed, 0))
+             vals_node = np.array(np.concatenate(vals_node, 0))
+             vals_seed = torch.from_numpy(vals_seed).float().to(self.device)
+             vals_node = torch.from_numpy(vals_node).float().to(self.device)
         
-        # Ensure float32
-        vals_seed = torch.from_numpy(vals_seed).float().to(self.device)
-        vals_node = torch.from_numpy(vals_node).float().to(self.device)
         indptr = np.array(indptr)                   # 由于每个节点的表示长度不一样，这里indptr用于标记start和end的位置
-        # 准备输入 vals_seed记录bs种子节点的向量表示，vals_node记录当前bs个社区节点的向量表示。
-        # 由于转换成一个维度，这里使用indptr区分各个节点/社区的位置
-        # batch_candidates存放每个社区的候选的节点，即边界节点/动作空间
         return vals_seed, vals_node, indptr, batch_candidates
 
     def _sample_actions(self, batch_logits: List) -> (List, List, List):

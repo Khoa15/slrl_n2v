@@ -14,8 +14,10 @@ class Agent(nn.Module):
         self.seed_embedding = nn.Linear(input_dim, hidden_size, bias=False)
         self.node_embedding = nn.Linear(input_dim, hidden_size, bias=False)
         self.input_mapping = nn.Sequential(
-            make_linear_block(hidden_size, hidden_size, Swish, norm_type),
-            make_linear_block(hidden_size, hidden_size, Swish, norm_type)
+            make_linear_block(hidden_size, hidden_size, Swish, norm_type, residual=True, dropout=0.1),
+            make_linear_block(hidden_size, hidden_size, Swish, norm_type, residual=True, dropout=0.1),
+            make_linear_block(hidden_size, hidden_size, Swish, norm_type, residual=True, dropout=0.1),
+            make_linear_block(hidden_size, hidden_size, Swish, norm_type, residual=True, dropout=0.1)
         )
         self.node_score_layer = nn.Linear(hidden_size, 1, bias=False)
         self.stopping_score_layer = nn.Linear(hidden_size, 2, bias=False)

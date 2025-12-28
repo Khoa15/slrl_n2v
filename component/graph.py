@@ -159,3 +159,61 @@ class Graph:
         self.adj_mat = sp.csr_matrix((np.ones(len(edges_list)), edges_array.T), shape=(self.n_nodes, self.n_nodes))
         self.adj_mat += self.adj_mat.T  # 使邻接矩阵对称
 
+    def augment_high_order(self, threshold=2):
+        """
+        Enhance the graph by adding edges between nodes that share significant common neighbors.
+        This implements the 'High-Order Relationships' paradigm.
+        """
+        # A^2 gives the number of paths of length 2 (Common Neighbors)
+        # Note: adj_mat is CSR. Matrix mult is efficient.
+        # self loops in adj_mat? No, usually 0 diagonal.
+        
+        # Ensure we work with float/int
+        adj = self.adj_mat
+        common_neig_mat = adj @ adj
+        
+        # We only care about new edges, so ignore existing ones and diagonal
+        # Get dense or iterate sparse? Sparse is better.
+        # Mask existing edges and self
+        # However, masking sparse is tricky. 
+        # Let's iterate over the upper triangle of common_neig_mat
+        
+        # Convert to COO to iterate
+        coo = common_neig_mat.tocoo()
+        
+        new_edges_count = 0
+        updates = collections.defaultdict(set)
+        
+        for u, v, w in zip(coo.row, coo.col, coo.data):
+            if u < v and w >= threshold:
+                # Check if edge already exists
+                if v not in self.neighbors[u]:
+                    updates[u].add(v)
+                    updates[v].add(u)
+                    new_edges_count += 1
+        
+        if new_edges_count > 0:
+            print(f"[Graph] Augmenting with High-Order Relationships: Added {new_edges_count} new edges (Threshold={threshold})")
+            
+            # Update neighbors
+            for u, vs in updates.items():
+                self.neighbors[u].update(vs)
+                # Update degree
+                self.degree[u] = self.degree.get(u, 0) + len(vs)
+
+            # Rebuild adj_mat
+            # NOTE: We can just efficiently update the sparse matrix, but rebuilding ensures consistency with neighbors dict logic
+            # reusing the logic from add_nodes_with_neighbors sort of
+            
+            edges_list = []
+            for node, nbs in self.neighbors.items():
+                for nb in nbs:
+                    if node < nb:
+                        edges_list.append((node, nb))
+            
+            edges_array = np.array(edges_list)
+            self.adj_mat = sp.csr_matrix((np.ones(len(edges_list)), edges_array.T), shape=(self.n_nodes, self.n_nodes))
+            self.adj_mat += self.adj_mat.T
+        else:
+            print("[Graph] No significant High-Order relationships found to add.")
+

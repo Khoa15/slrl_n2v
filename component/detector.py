@@ -18,12 +18,11 @@ from component.graph import Graph
 from utils import wr_file
 from sklearn.cluster import KMeans
 from sklearn_extra.cluster import KMedoids
-from scipy.spatial.distance import squareform, pdist
 from sklearn.mixture import GaussianMixture
 from scipy.cluster.hierarchy import linkage, fcluster
-from scipy.cluster.hierarchy import linkage, fcluster
-from scipy.spatial.distance import squareform
-from component.node2vec_embedding import compute_similarity_matrix_node2vec
+from scipy.spatial.distance import squareform, pdist
+from sklearn.metrics.pairwise import cosine_similarity
+# from component.node2vec_embedding import compute_similarity_matrix_node2vec
 
 
 
@@ -108,41 +107,32 @@ class Detector:
         '''
         初始化expander
         '''
-        from component.node2vec_embedding import Node2VecEmbedding
+        from component.gnn import GIN, normalize_adj_torch
 
         args = self.args
         device = self.device
         
-        # --- Deep Learning: Generate Node2Vec Embeddings ---
-        print("Generating Node2Vec Embeddings for Deep RL Agent...")
-        embedding_dim = getattr(args, 'embedding_dim', 32) # Default to 32 if not set
+        # --- Deep Learning: GIN Embeddings ---
+        print("Initializing GIN for Deep RL Agent...", flush=True)
+        embedding_dim = getattr(args, 'embedding_dim', 32)
         
-        # Use simple networkx for embedding generation on the subgraph
-        # knowcomSeedGraph.adj_mat is scipy sparse. Convert to nx.
-        G_nx = nx.from_scipy_sparse_array(self.knowcomSeedGraph.adj_mat)
+        # GIN Model
+        # Input dim for GIN? If we use constant features, we can choose any dim.
+        # Let's use embedding_dim as input dim for simplicity (using Ones).
+        gin_model = GIN(input_dim=embedding_dim, hidden_dim=embedding_dim, num_layers=3).to(device)
         
-        embedder = Node2VecEmbedding(dimension=embedding_dim, walk_length=10, num_walks=10, window_size=5)
-        # fit_transform returns dict: node_idx -> vector
-        emb_dict = embedder.fit_transform(G_nx)
-        
-        # Convert to matrix aligned with graph nodes (0 to n_nodes-1)
-        n_nodes = self.knowcomSeedGraph.n_nodes
-        node_embeddings = np.zeros((n_nodes, embedding_dim), dtype=np.float32)
-        for i in range(n_nodes):
-            if i in emb_dict:
-                node_embeddings[i] = emb_dict[i]
-            else:
-                # Should not happen for initial graph, but as fallback
-                pass
-        
-        # Input dim = 1 (Diffusion Scalar) + Embedding Dim
+        # Input dim = 1 (Diffusion Scalar) + Embedding Dim (GIN Output)
         agent_input_dim = 1 + embedding_dim
         print(f"Agent Input Dimension: {agent_input_dim}")
 
         expander_model = Agent(args.hidden_size, input_dim=agent_input_dim).to(device)
-        expander_optimizer = optim.Adam(expander_model.parameters(), lr=args.g_lr)
+        
+        # Combine parameters for optimizer
+        all_params = list(expander_model.parameters()) + list(gin_model.parameters())
+        expander_optimizer = optim.Adam(all_params, lr=args.g_lr)
+        
         expander = Expander(args, self.knowcomSeedGraph, expander_model, expander_optimizer, device,
-                      max_size=args.max_size, node_embeddings=node_embeddings)
+                      max_size=args.max_size, gnn_model=gin_model)
         return expander
 
     def detect(self):
@@ -208,41 +198,48 @@ class Detector:
 
 
     def computeSimiAndWrite(self):
-        communities_copy = copy.deepcopy(self.knowcoms)
-        # sp_graph = self.com_trans_graph(communities_copy)  # Ckv是一个二维数组，每一行代表一个已知社区（节点的标号），共10个
-        # sp = ShortestPath(normalize=True, with_labels=False)
-        # sp.fit_transform(sp_graph)
-        # similarity = sp.transform(sp_graph)
-        # simi = np.nan_to_num(similarity)
+        # NOT USED currently, but updated to avoid Node2Vec dependency if enabled
+        pass 
+        # Logic removed to avoid confusion and dependency since it was commented out in init.
+
+    def compute_similarity_using_gin(self, communities):
+        """
+        Compute similarity matrix using GIN embeddings from self.expander
+        """
+        if self.expander.current_embeddings is None:
+             # If called before any training/forward, we need to force a GIN pass.
+             # Or return identity/zeros. But it's usually called after iter 0.
+             return np.zeros((len(communities), len(communities)))
         
-        # New Node2Vec Implementation
-        G_nx = nx.from_numpy_array(self.knowcomSeedGraph.adj_mat)
-        simi = compute_similarity_matrix_node2vec(communities_copy, G_nx)
-        simi = np.nan_to_num(simi)
-
-        spectral_clustering = SpectralClustering(n_clusters=2, affinity='precomputed')
-        labels = spectral_clustering.fit_predict(simi)
-        a,b = 0, 0
-        for i in range(0, len(labels)):
-            if labels[i] == 0:
-                a +=1
-            else:
-                b +=1
-        print("a:",a)
-        print("b:",b)
-
-        data = simi
-        workbook = Workbook()
-        # 激活默认工作表
-        sheet = workbook.active
-
-        # 遍历二维列表，并将数据写入工作表
-        for row_idx, row in enumerate(data):
-            for col_idx, value in enumerate(row):
-                sheet.cell(row=row_idx + 1, column=col_idx + 1, value=value)
-
-        # 保存工作簿到指定文件
-        workbook.save(f"AAAi/{self.args.dataset}_simi.xls")
+        # Get embeddings: Tensor [N, Dim] on Device
+        node_embs = self.expander.current_embeddings
+        
+        com_vecs = []
+        for com in communities:
+            # Filter valid nodes
+            valid_nodes = [n for n in com if n < len(node_embs)]
+            if not valid_nodes:
+                com_vecs.append(torch.zeros(node_embs.shape[1]).to(self.device))
+                continue
+            
+            indices = torch.tensor(valid_nodes, dtype=torch.long).to(self.device)
+            # Gather
+            vecs = node_embs[indices] # [m, dim]
+            mean_vec = torch.mean(vecs, dim=0) # [dim]
+            com_vecs.append(mean_vec)
+            
+        if not com_vecs:
+             return np.zeros((len(communities), len(communities)))
+            
+        # Stack
+        com_matrix = torch.stack(com_vecs) # [Num_Coms, Dim]
+        
+        # Cosine Sim
+        # Move to cpu for sklearn or do in torch
+        com_matrix_np = com_matrix.detach().cpu().numpy()
+        
+        sim_matrix = cosine_similarity(com_matrix_np)
+        return (sim_matrix + 1) / 2 # Normalize to [0, 1]
 
     def updateTraincom(self, com):
         '''
@@ -251,16 +248,11 @@ class Detector:
         '''
         communities_copy = copy.deepcopy(self.knowcoms)
         communities_copy.insert(0, com)
-        # sp_graph = self.com_trans_graph(communities_copy)  # Ckv是一个二维数组，每一行代表一个已知社区（节点的标号），共10个
-        # sp = ShortestPath(normalize=True, with_labels=False)
-        # sp.fit_transform(sp_graph)
-        # similarity = sp.transform(sp_graph)
-        # simi = np.nan_to_num(similarity)
         
-        # New Node2Vec Implementation
-        G_nx = nx.from_numpy_array(self.knowcomSeedGraph.adj_mat)
-        simi = compute_similarity_matrix_node2vec(communities_copy, G_nx)
+        # New GIN Implementation
+        simi = self.compute_similarity_using_gin(communities_copy)
         simi = np.nan_to_num(simi)
+        
         traincom = []
         k = self.args.k
         # traincom = self.UsingScSelectCom(simi, communities_copy, 2)
@@ -303,9 +295,19 @@ class Detector:
         @param communities: 已知社区+局部结构
         @param K: 聚类系数
         '''
+        # --- High-Order Enhancement (Novel Paradigm) ---
+        # Improve affinity matrix by capturing 2nd-order proximity
+        # M_new = M + M^2
+        
+        simi_2 = np.dot(simi, simi)
+        if simi_2.max() > 0:
+            simi_2 = simi_2 / simi_2.max()
+        
+        simi_enhanced = simi + simi_2
+        
         # 选在其中的一类
         spectral_clustering = SpectralClustering(n_clusters=K, affinity='precomputed')
-        labels = spectral_clustering.fit_predict(simi)
+        labels = spectral_clustering.fit_predict(simi_enhanced)
         # 输出聚类结果
         simis, traincom = [], []
         # print(labels)
